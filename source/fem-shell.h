@@ -59,7 +59,7 @@ namespace ShellSolid
   class shellsolid
   {
   public:
-    shellsolid(SerialMesh &, const shellparam &);
+    shellsolid(const SerialMesh &, const shellparam &);
     ~shellsolid(){};
     // function prototypes:
     void read_forcing();
@@ -67,6 +67,10 @@ namespace ShellSolid
     void make_constraints(std::map<boundary_id_type, unsigned int> &);
 
     void writeOutput();
+
+    void set_solution(const std::vector<Number> &);
+
+    inline const std::vector<Number> &get_solution() { return this->sols; };
 
     void run();
 
@@ -91,6 +95,16 @@ namespace ShellSolid
                           DenseMatrix<Real> &dphi,
                           Real *area,
                           DenseMatrix<Real> &Ke_p);
+
+    void
+    B_plane_tri(Real *area, DenseMatrix<Real> &dphi, DenseMatrix<Real> &out);
+
+    void B_plane_quad(Real *area,
+                      DenseMatrix<Real> &dphi,
+                      DenseMatrix<Real> &transUV,
+                      Real qp_x,
+                      Real qp_y,
+                      DenseMatrix<Real> &out);
 
     static void evalBTri(EquationSystems &es,
                          DenseVector<Real> &C,
@@ -125,9 +139,12 @@ namespace ShellSolid
     static void assemble_elasticity(EquationSystems &es,
                                     const std::string &system_name);
 
+    void stress_calculation();
+
     SerialMesh mesh;
     EquationSystems equation_systems;
     LinearImplicitSystem &system;
+    ExplicitSystem &stress_system;
 
     std::string in_filename;               // mesh file for import
     std::string force_filename;            // forcefile
@@ -137,6 +154,7 @@ namespace ShellSolid
     Real em;                               // Young's modulus
     Real thickness;                        // Mesh thickness
     std::vector<DenseVector<Real>> forces; // nodal force vector
+    std::vector<Number> sols;              // solution vector
     bool isOutfileSet;                     // should outputs be written or not
 
     DenseMatrix<Real> Dp, Dm; // material matrix for plate (Dp) and plane (Dm)

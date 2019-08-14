@@ -104,10 +104,12 @@ namespace ShellSolid
     return (!failed);
   }
 
-  shellsolid::shellsolid(SerialMesh &mesh, const shellparam &param)
+  shellsolid::shellsolid(const SerialMesh &mesh, const shellparam &param)
     : mesh(mesh),
-      equation_systems(mesh),
+      equation_systems(this->mesh),
       system(equation_systems.add_system<LinearImplicitSystem>("Elasticity")),
+      stress_system(
+        equation_systems.add_system<ExplicitSystem>("StressSystem")),
       in_filename(param.in_filename),
       force_filename(param.force_filename),
       out_filename(param.out_filename),
@@ -162,6 +164,17 @@ namespace ShellSolid
     unsigned int ty_var = system.add_variable("ty", FIRST, LAGRANGE);
     unsigned int tz_var = system.add_variable("tz", FIRST, LAGRANGE);
 
+    // Add stress tensor to the system
+    stress_system.add_variable("sigma_xx", CONSTANT, MONOMIAL);
+    stress_system.add_variable("sigma_xy", CONSTANT, MONOMIAL);
+    stress_system.add_variable("sigma_xz", CONSTANT, MONOMIAL);
+    stress_system.add_variable("sigma_yx", CONSTANT, MONOMIAL);
+    stress_system.add_variable("sigma_yy", CONSTANT, MONOMIAL);
+    stress_system.add_variable("sigma_yz", CONSTANT, MONOMIAL);
+    stress_system.add_variable("sigma_zx", CONSTANT, MONOMIAL);
+    stress_system.add_variable("sigma_zy", CONSTANT, MONOMIAL);
+    stress_system.add_variable("sigma_zz", CONSTANT, MONOMIAL);
+
     // We must add the Dirichlet boundary condition _before_ we call
     // equation_systems.init()
     // Create a ZeroFunction to initialize dirichlet_bc
@@ -190,6 +203,22 @@ namespace ShellSolid
       }
   }
 
+  void shellsolid::set_solution(const std::vector<Number> &solutions)
+  {
+    const auto &dof_map = system.get_dof_map();
+    std::vector<dof_id_type> dof_id_list(system.n_vars());
+    for (auto node = mesh.active_nodes_begin(); node != mesh.active_nodes_end();
+         ++node)
+      {
+        auto node_id = (*node)->id();
+        dof_map.dof_indices(*node, dof_id_list);
+        for (auto i : {0, 1, 2})
+          {
+            system.solution->set(dof_id_list[i], solutions[6 * node_id + i]);
+          }
+      }
+  }
+
   void shellsolid::run()
   {
     initMaterialMatrices();
@@ -203,11 +232,11 @@ namespace ShellSolid
      * Solve the system
      **/
     system.attach_assemble_function(shellsolid::assemble_elasticity);
-    equation_systems.solve();
-    // store the solution in a vector
-    std::vector<Number> sols;
+    equation_systems.get_system("Elasticity").solve();
 
     equation_systems.build_solution_vector(sols);
+
+    stress_calculation();
 
     if (debug)
       {
@@ -216,35 +245,34 @@ namespace ShellSolid
         std::cout << std::endl << "RHS:" << std::endl;
         system.rhs->print(std::cout);
         std::cout << std::endl;
-      }
-
-    // be sure that only the master process (id = 0) works on the solution,
-    // since the rest of the processes only see their own partial solution
-    if (global_processor_id() == 0)
-      {
-        std::cout << "Solution: u_vec = [";
-        MeshBase::const_node_iterator no = mesh.nodes_begin();
-        const MeshBase::const_node_iterator end_no = mesh.nodes_end();
-        for (; no != end_no; ++no)
+        // be sure that only the master process (id = 0) works on the solution,
+        // since the rest of the processes only see their own partial solution
+        if (global_processor_id() == 0)
           {
-            Node *nd = *no;
-            int id = nd->id();
-            Real displ_x = sols[6 * id];
-            Real displ_y = sols[6 * id + 1];
-            Real displ_z = sols[6 * id + 2];
-            std::cout << "u= " << displ_x << ", v= " << displ_y
-                      << ", w= " << displ_z;
-            Real twist_x = sols[6 * id + 3];
-            Real twist_y = sols[6 * id + 4];
-            Real twist_z = sols[6 * id + 5];
-            std::cout << ", tx= " << twist_x << ", ty= " << twist_y
-                      << ", tz= " << twist_z << "]" << std::endl;
-            // apply displacements to mesh nodes
-            (*nd)(0) += displ_x;
-            (*nd)(1) += displ_y;
-            (*nd)(2) += displ_z;
+            std::cout << "Solution: u_vec = [";
+            MeshBase::const_node_iterator no = mesh.nodes_begin();
+            const MeshBase::const_node_iterator end_no = mesh.nodes_end();
+            for (; no != end_no; ++no)
+              {
+                Node *nd = *no;
+                int id = nd->id();
+                Real displ_x = sols[15 * id];
+                Real displ_y = sols[15 * id + 1];
+                Real displ_z = sols[15 * id + 2];
+                std::cout << "u= " << displ_x << ", v= " << displ_y
+                          << ", w= " << displ_z;
+                Real twist_x = sols[15 * id + 3];
+                Real twist_y = sols[15 * id + 4];
+                Real twist_z = sols[15 * id + 5];
+                std::cout << ", tx= " << twist_x << ", ty= " << twist_y
+                          << ", tz= " << twist_z << "]" << std::endl;
+                // apply displacements to mesh nodes
+                (*nd)(0) += displ_x;
+                (*nd)(1) += displ_y;
+                (*nd)(2) += displ_z;
+              }
+            std::cout << "]" << std::endl << std::endl;
           }
-        std::cout << "]" << std::endl << std::endl;
       }
 
     if (isOutfileSet)
@@ -758,6 +786,92 @@ namespace ShellSolid
               }
           } // end of quadrature point for-loops
       }     // end of element type switch
+  }
+
+  /*Construct the strain displacement matrix B for tri-3 plane element*/
+  /*Required for stress calculation */
+  void shellsolid::B_plane_tri(Real *area,
+                               DenseMatrix<Real> &dphi,
+                               DenseMatrix<Real> &out)
+  {
+    out.resize(3, 6);
+    out(0, 0) = dphi(2, 1);  //  y23
+    out(0, 2) = dphi(1, 1);  //  y31
+    out(0, 4) = dphi(0, 1);  //  y12
+    out(1, 1) = -dphi(2, 0); // -x23
+    out(1, 3) = -dphi(1, 0); // -x31
+    out(1, 5) = -dphi(0, 0); // -x12
+    out(2, 0) = -dphi(2, 0); // -x23
+    out(2, 1) = dphi(2, 1);  //  y23
+    out(2, 2) = -dphi(1, 0); // -x31
+    out(2, 3) = dphi(1, 1);  //  y31
+    out(2, 4) = -dphi(0, 0); // -x12
+    out(2, 5) = dphi(0, 1);  //  y12
+    out *= 1.0 / (2.0 * (*area));
+  }
+
+  /*Construct the strain displacement matrix B for quad-4 plane element*/
+  /*Required for stress calculation */
+  void shellsolid::B_plane_quad(Real *area,
+                                DenseMatrix<Real> &dphi,
+                                DenseMatrix<Real> &transUV,
+                                Real qp_x,
+                                Real qp_y,
+                                DenseMatrix<Real> &out)
+  {
+    DenseMatrix<Real> G(4, 8);    // temp matrix
+    DenseMatrix<Real> J(2, 2);    // Jacobian
+    DenseVector<Real> shapeQ4(4); // evaluation of shape functions
+    DenseVector<Real> dhdr(4),
+      dhds(4); // derivatives of shape functions wrt local coordinates r and s
+
+    shapeQ4(0) = 0.25 * (1 - qp_x) * (1 - qp_y);
+    shapeQ4(1) = 0.25 * (1 + qp_x) * (1 - qp_y);
+    shapeQ4(2) = 0.25 * (1 + qp_x) * (1 + qp_y);
+    shapeQ4(3) = 0.25 * (1 - qp_x) * (1 + qp_y);
+
+    dhdr(0) = -0.25 * (1 - qp_y);
+    dhdr(1) = 0.25 * (1 - qp_y);
+    dhdr(2) = 0.25 * (1 + qp_y);
+    dhdr(3) = -0.25 * (1 + qp_y);
+
+    dhds(0) = -0.25 * (1 - qp_x);
+    dhds(1) = -0.25 * (1 + qp_x);
+    dhds(2) = 0.25 * (1 + qp_x);
+    dhds(3) = 0.25 * (1 - qp_x);
+
+    J.resize(2, 2); // resizing automatically zero-s entries
+    for (int i = 0; i < 4; i++)
+      {
+        J(0, 0) += dhdr(i) * transUV(0, i);
+        J(0, 1) += dhdr(i) * transUV(1, i);
+        J(1, 0) += dhds(i) * transUV(0, i);
+        J(1, 1) += dhds(i) * transUV(1, i);
+      }
+
+    Real detjacob = J.det(); // Jacobian determinant
+
+    out.resize(3, 4);
+    out(0, 0) = J(1, 1);
+    out(0, 1) = -J(0, 1);
+    out(1, 2) = -J(1, 0);
+    out(1, 3) = J(0, 0);
+    out(2, 0) = -J(1, 0);
+    out(2, 1) = J(0, 0);
+    out(2, 2) = J(1, 1);
+    out(2, 3) = -J(0, 1);
+    out *= 1.0 / detjacob;
+
+    for (int i = 0; i < 4; i++)
+      {
+        G(0, 2 * i) = dhdr(i);
+        G(1, 2 * i) = dhds(i);
+        G(2, 1 + 2 * i) = dhdr(i);
+        G(3, 1 + 2 * i) = dhds(i);
+      }
+
+    // final step to get the strain-displacement-matrix B:
+    out.right_multiply(G);
   }
 
   /**
@@ -1405,6 +1519,233 @@ namespace ShellSolid
         system.matrix->add_matrix(Ke, dof_indices);
         system.rhs->add_vector(Fe, dof_indices);
       }
+  }
+
+  /* Stress Calculation*/
+  void shellsolid::stress_calculation()
+  {
+    const unsigned int dim = mesh.mesh_dimension();
+
+    unsigned int displacement_vars[6];
+    displacement_vars[0] = system.variable_number("u");
+    displacement_vars[1] = system.variable_number("v");
+    displacement_vars[2] = system.variable_number("w");
+    displacement_vars[3] = system.variable_number("tx");
+    displacement_vars[4] = system.variable_number("ty");
+    displacement_vars[5] = system.variable_number("tz");
+
+    const DofMap &dof_map = system.get_dof_map();
+    std::vector<std::vector<dof_id_type>> dof_indices_var(
+      system.n_vars()); // Vector stores global dof dof_indices_var[var
+                        // no.][node no.]
+
+    unsigned int sigma_vars[3][3];
+    sigma_vars[0][0] = stress_system.variable_number("sigma_xx");
+    sigma_vars[0][1] = stress_system.variable_number("sigma_xy");
+    sigma_vars[0][2] = stress_system.variable_number("sigma_xz");
+    sigma_vars[1][0] = stress_system.variable_number("sigma_yx");
+    sigma_vars[1][1] = stress_system.variable_number("sigma_yy");
+    sigma_vars[1][2] = stress_system.variable_number("sigma_yz");
+    sigma_vars[2][0] = stress_system.variable_number("sigma_zx");
+    sigma_vars[2][1] = stress_system.variable_number("sigma_zy");
+    sigma_vars[2][2] = stress_system.variable_number("sigma_zz");
+
+    const DofMap &stress_dof_map = stress_system.get_dof_map();
+    std::vector<dof_id_type> stress_dof_indices_var;
+    DenseMatrix<Real> B_m; // Strain displacement matrix
+    DenseMatrix<Real> B_b; // Strain displacement matrix bending
+    DenseMatrix<Real>
+      trafo; // global to local coordinate system transformation matrix
+    DenseMatrix<Real> trafo_2; // tranformation matrix 6x6
+    DenseMatrix<Real>
+      transUV; // stores the transformed positions of the element's nodes
+    DenseMatrix<Real>
+      dphi;          // contains the first partial derivatives of the element
+    Real area = 0.0; // the area of the element
+
+    // plane element stress calculation
+    DenseVector<Real>
+      elem_dis_local; // element displacement at eact node (u1, v1, w1, tx1,
+                      // tx2, tx3 ...) in local co-ordinates
+    DenseVector<Real> elem_dis_local_uv; // only u and v componenets required
+                                         // for stress calculation
+    DenseVector<Real> elem_stress; // stress vector sigma_x, sigma_y, tau_xy
+                                   // (local co-ordinates)
+    DenseMatrix<Real> temp;
+    DenseMatrix<Real> elem_stress_tensor; // element stress tensor
+
+    MeshBase::const_element_iterator el = mesh.active_local_elements_begin();
+    const MeshBase::const_element_iterator end_el =
+      mesh.active_local_elements_end();
+    for (; el != end_el; ++el)
+      {
+        const Elem *elem = *el;
+        ElemType type = elem->type();
+
+        for (unsigned int var = 0; var < 6; var++)
+          {
+            dof_map.dof_indices(
+              elem, dof_indices_var[var], displacement_vars[var]);
+          }
+        initElement(&elem, transUV, trafo, dphi, &area);
+        // creating 6x6 transformation matrix
+        trafo_2.resize(6, 6);
+        for (int k = 0; k < 2; k++)
+          {
+            for (int i = 0; i < 3; i++)
+              {
+                for (int j = 0; j < 3; j++)
+                  {
+                    trafo_2(3 * k + i, 3 * k + j) = trafo(i, j);
+                  }
+              }
+          }
+
+        if (type == TRI3)
+          {
+            int nodes = 3;
+            elem_stress.resize(3);
+            temp.resize(3, 3);
+            B_m.resize(3, 6);
+            elem_dis_local.resize(6 * nodes);
+            elem_dis_local_uv.resize(2 * nodes);
+            elem_stress_tensor.resize(3, 3);
+
+            B_plane_tri(&area, dphi, B_m);
+
+            // transforming solution from global to local co-ordinates
+            for (int i = 0; i < nodes; i++)
+              {
+                for (int j = 0; j < 6; j++)
+                  {
+                    for (int l = 0; l < 6; l++)
+                      {
+                        elem_dis_local(j + 6 * i) +=
+                          trafo_2(j, l) *
+                          system.current_solution(dof_indices_var[l][i]);
+                      }
+                  }
+              }
+
+            // selecting only u and v components required for plane stress
+            // calculation
+            for (int i = 0; i < nodes; i++)
+              {
+                elem_dis_local_uv(2 * i) = elem_dis_local(6 * i);
+                elem_dis_local_uv(2 * i + 1) = elem_dis_local(6 * i + 1);
+              }
+
+            temp = Dm;
+            temp.right_multiply(B_m);
+
+            // stress calculation
+            for (unsigned int i = 0; i < 3; i++)
+              {
+                for (unsigned int j = 0; j < 6; j++)
+                  {
+                    elem_stress(i) += temp(i, j) * elem_dis_local_uv(j);
+                  }
+              }
+
+            elem_stress_tensor(0, 0) = elem_stress(0);
+            elem_stress_tensor(0, 1) = elem_stress(2);
+            elem_stress_tensor(1, 0) = elem_stress(2);
+            elem_stress_tensor(1, 1) = elem_stress(1);
+
+            // Transforming stress tensor to global co-ordinate system
+            elem_stress_tensor.right_multiply(trafo);
+            elem_stress_tensor.left_multiply_transpose(trafo);
+          }
+
+        if (type == QUAD4)
+          {
+            int nodes = 4;
+            elem_dis_local.resize(6 * nodes);
+            elem_dis_local_uv.resize(2 * nodes);
+            elem_stress_tensor.resize(3, 3);
+
+            for (int i = 0; i < nodes; i++)
+              {
+                for (int j = 0; j < 6; j++)
+                  {
+                    for (int k = 0; k < 6; k++)
+                      {
+                        elem_dis_local(j + 6 * i) +=
+                          trafo_2(j, k) *
+                          system.current_solution(dof_indices_var[k][i]);
+                      }
+                  }
+              }
+
+            for (int i = 0; i < nodes; i++)
+              {
+                elem_dis_local_uv(2 * i) = elem_dis_local(6 * i);
+                elem_dis_local_uv(2 * i + 1) = elem_dis_local(6 * i + 1);
+              }
+
+            Real root = sqrt(1.0 / 3.0); // Quadrature point
+            for (int ii = 0; ii < 2; ii++)
+              {
+                Real r = pow(-1.0, ii) * root; // +/- root
+                for (int jj = 0; jj < 2; jj++)
+                  {
+                    elem_stress.resize(3);
+                    temp.resize(3, 3);
+                    B_m.resize(3, 8);
+                    Real s = pow(-1.0, jj) * root; // +/- root
+
+                    B_plane_quad(&area, dphi, transUV, r, s, B_m);
+
+                    temp = Dm;
+                    temp.right_multiply(B_m);
+
+                    for (unsigned int i = 0; i < 3; i++)
+                      {
+                        for (unsigned int j = 0; j < 8; j++)
+                          {
+                            elem_stress(i) += temp(i, j) * elem_dis_local_uv(j);
+                          }
+                      }
+
+                    elem_stress_tensor(0, 0) =
+                      elem_stress_tensor(0, 0) + elem_stress(0);
+                    elem_stress_tensor(0, 1) =
+                      elem_stress_tensor(0, 1) + elem_stress(2);
+                    elem_stress_tensor(1, 0) =
+                      elem_stress_tensor(1, 0) + elem_stress(2);
+                    elem_stress_tensor(1, 1) =
+                      elem_stress_tensor(1, 1) + elem_stress(1);
+
+                    elem_stress_tensor.right_multiply(trafo);
+                    elem_stress_tensor.left_multiply_transpose(trafo);
+                  }
+              }
+            elem_stress_tensor.scale(
+              1.0 / 4.0); // Averaging stress at quadrature points
+          }
+
+        // saving element stress in the system
+        for (unsigned int i = 0; i < 3; i++)
+          {
+            for (unsigned int j = 0; j < 3; j++)
+              {
+                stress_dof_map.dof_indices(
+                  elem, stress_dof_indices_var, sigma_vars[i][j]);
+                dof_id_type dof_index = stress_dof_indices_var[0];
+
+                if ((stress_system.solution->first_local_index() <=
+                     dof_index) &&
+                    (dof_index < stress_system.solution->last_local_index()))
+                  {
+                    stress_system.solution->set(dof_index,
+                                                elem_stress_tensor(i, j));
+                  }
+              }
+          }
+      }
+
+    stress_system.solution->close();
+    stress_system.update();
   }
 
   /**
