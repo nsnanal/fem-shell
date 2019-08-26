@@ -110,6 +110,8 @@ namespace ShellSolid
       system(equation_systems.add_system<LinearImplicitSystem>("Elasticity")),
       stress_system(
         equation_systems.add_system<ExplicitSystem>("StressSystem")),
+      stress_system_b(
+        equation_systems.add_system<ExplicitSystem>("StressSystem_b")),
       in_filename(param.in_filename),
       force_filename(param.force_filename),
       out_filename(param.out_filename),
@@ -164,7 +166,7 @@ namespace ShellSolid
     unsigned int ty_var = system.add_variable("ty", FIRST, LAGRANGE);
     unsigned int tz_var = system.add_variable("tz", FIRST, LAGRANGE);
 
-    // Add stress tensor to the system
+    // Add membrane stress tensor to the system
     stress_system.add_variable("sigma_xx", CONSTANT, MONOMIAL);
     stress_system.add_variable("sigma_xy", CONSTANT, MONOMIAL);
     stress_system.add_variable("sigma_xz", CONSTANT, MONOMIAL);
@@ -174,6 +176,17 @@ namespace ShellSolid
     stress_system.add_variable("sigma_zx", CONSTANT, MONOMIAL);
     stress_system.add_variable("sigma_zy", CONSTANT, MONOMIAL);
     stress_system.add_variable("sigma_zz", CONSTANT, MONOMIAL);
+
+    // Add bending stress tensor to the system
+    stress_system_b.add_variable("sigma_b_xx", CONSTANT, MONOMIAL);
+    stress_system_b.add_variable("sigma_b_xy", CONSTANT, MONOMIAL);
+    stress_system_b.add_variable("sigma_b_xz", CONSTANT, MONOMIAL);
+    stress_system_b.add_variable("sigma_b_yx", CONSTANT, MONOMIAL);
+    stress_system_b.add_variable("sigma_b_yy", CONSTANT, MONOMIAL);
+    stress_system_b.add_variable("sigma_b_yz", CONSTANT, MONOMIAL);
+    stress_system_b.add_variable("sigma_b_zx", CONSTANT, MONOMIAL);
+    stress_system_b.add_variable("sigma_b_zy", CONSTANT, MONOMIAL);
+    stress_system_b.add_variable("sigma_b_zz", CONSTANT, MONOMIAL);
 
     // We must add the Dirichlet boundary condition _before_ we call
     // equation_systems.init()
@@ -236,7 +249,7 @@ namespace ShellSolid
 
     equation_systems.build_solution_vector(sols);
 
-    stress_calculation();
+    stress_calculation(equation_systems);
 
     if (debug)
       {
@@ -256,14 +269,14 @@ namespace ShellSolid
               {
                 Node *nd = *no;
                 int id = nd->id();
-                Real displ_x = sols[15 * id];
-                Real displ_y = sols[15 * id + 1];
-                Real displ_z = sols[15 * id + 2];
+                Real displ_x = sols[24 * id];
+                Real displ_y = sols[24 * id + 1];
+                Real displ_z = sols[24 * id + 2];
                 std::cout << "u= " << displ_x << ", v= " << displ_y
                           << ", w= " << displ_z;
-                Real twist_x = sols[15 * id + 3];
-                Real twist_y = sols[15 * id + 4];
-                Real twist_z = sols[15 * id + 5];
+                Real twist_x = sols[24 * id + 3];
+                Real twist_y = sols[24 * id + 4];
+                Real twist_z = sols[24 * id + 5];
                 std::cout << ", tx= " << twist_x << ", ty= " << twist_y
                           << ", tz= " << twist_z << "]" << std::endl;
                 // apply displacements to mesh nodes
@@ -1522,7 +1535,7 @@ namespace ShellSolid
   }
 
   /* Stress Calculation*/
-  void shellsolid::stress_calculation()
+  void shellsolid::stress_calculation(EquationSystems &es)
   {
     const unsigned int dim = mesh.mesh_dimension();
 
@@ -1550,8 +1563,21 @@ namespace ShellSolid
     sigma_vars[2][1] = stress_system.variable_number("sigma_zy");
     sigma_vars[2][2] = stress_system.variable_number("sigma_zz");
 
+    unsigned int sigma_vars_b[3][3];
+    sigma_vars_b[0][0] = stress_system_b.variable_number("sigma_b_xx");
+    sigma_vars_b[0][1] = stress_system_b.variable_number("sigma_b_xy");
+    sigma_vars_b[0][2] = stress_system_b.variable_number("sigma_b_xz");
+    sigma_vars_b[1][0] = stress_system_b.variable_number("sigma_b_yx");
+    sigma_vars_b[1][1] = stress_system_b.variable_number("sigma_b_yy");
+    sigma_vars_b[1][2] = stress_system_b.variable_number("sigma_b_yz");
+    sigma_vars_b[2][0] = stress_system_b.variable_number("sigma_b_zx");
+    sigma_vars_b[2][1] = stress_system_b.variable_number("sigma_b_zy");
+    sigma_vars_b[2][2] = stress_system_b.variable_number("sigma_b_zz");
+
     const DofMap &stress_dof_map = stress_system.get_dof_map();
     std::vector<dof_id_type> stress_dof_indices_var;
+    const DofMap &stress_b_dof_map = stress_system_b.get_dof_map();
+    std::vector<dof_id_type> stress_b_dof_indices_var;
     DenseMatrix<Real> B_m; // Strain displacement matrix
     DenseMatrix<Real> B_b; // Strain displacement matrix bending
     DenseMatrix<Real>
@@ -1572,7 +1598,15 @@ namespace ShellSolid
     DenseVector<Real> elem_stress; // stress vector sigma_x, sigma_y, tau_xy
                                    // (local co-ordinates)
     DenseMatrix<Real> temp;
-    DenseMatrix<Real> elem_stress_tensor; // element stress tensor
+    DenseMatrix<Real> elem_stress_tensor; // plane element stress tensor
+
+    // plate bending stress calculation
+    DenseVector<Real> elem_dis_local_w; // only w, tx, ty componenets required
+                                        // for bending stress calculation
+    DenseVector<Real> elem_stress_b;    // bending stress vector M_x/I, M_y/I,
+                                        // M_xy/I (local co-ordinates)
+    DenseMatrix<Real> elem_stress_tensor_b; // bending stress tensor
+    DenseVector<Real> sidelen; // stores squared side lengths of the element
 
     MeshBase::const_element_iterator el = mesh.active_local_elements_begin();
     const MeshBase::const_element_iterator end_el =
@@ -1609,7 +1643,9 @@ namespace ShellSolid
             B_m.resize(3, 6);
             elem_dis_local.resize(6 * nodes);
             elem_dis_local_uv.resize(2 * nodes);
+            elem_dis_local_w.resize(3 * nodes);
             elem_stress_tensor.resize(3, 3);
+            elem_stress_tensor_b.resize(3, 3);
 
             B_plane_tri(&area, dphi, B_m);
 
@@ -1627,18 +1663,23 @@ namespace ShellSolid
                   }
               }
 
-            // selecting only u and v components required for plane stress
-            // calculation
             for (int i = 0; i < nodes; i++)
               {
+                // selecting only u and v components required for plane stress
+                // calculation
                 elem_dis_local_uv(2 * i) = elem_dis_local(6 * i);
                 elem_dis_local_uv(2 * i + 1) = elem_dis_local(6 * i + 1);
+                // selecting only w, tx, ty components required for bending
+                // stress calculation
+                elem_dis_local_w(3 * i) = elem_dis_local(6 * i + 2);
+                elem_dis_local_w(3 * i + 1) = elem_dis_local(6 * i + 3);
+                elem_dis_local_w(3 * i + 2) = elem_dis_local(6 * i + 4);
               }
 
             temp = Dm;
             temp.right_multiply(B_m);
 
-            // stress calculation
+            // plane stress calculation
             for (unsigned int i = 0; i < 3; i++)
               {
                 for (unsigned int j = 0; j < 6; j++)
@@ -1655,6 +1696,64 @@ namespace ShellSolid
             // Transforming stress tensor to global co-ordinate system
             elem_stress_tensor.right_multiply(trafo);
             elem_stress_tensor.left_multiply_transpose(trafo);
+
+            // quadrature points
+            std::vector<std::vector<double>> qps(3);
+            for (unsigned int i = 0; i < qps.size(); i++)
+              {
+                qps[i].resize(2);
+              }
+            qps[0][0] = 1.0 / 6.0;
+            qps[0][1] = 1.0 / 6.0;
+            qps[1][0] = 2.0 / 3.0;
+            qps[1][1] = 1.0 / 6.0;
+            qps[2][0] = 1.0 / 6.0;
+            qps[2][1] = 2.0 / 3.0;
+
+            // squared side lengths (required for calculation of strain
+            // diaplacement matrix bending)
+            sidelen.resize(3);
+            sidelen(0) = pow(dphi(0, 0), 2.0) +
+                         pow(dphi(0, 1), 2.0); // side AB, x12^2 + y12^2
+            sidelen(1) = pow(dphi(1, 0), 2.0) +
+                         pow(dphi(1, 1), 2.0); // side AC, x31^2 + y31^2
+            sidelen(2) = pow(dphi(2, 0), 2.0) +
+                         pow(dphi(2, 1), 2.0); // side BC, x23^2 + y23^2
+
+            for (unsigned int q = 0; q < qps.size(); q++)
+              {
+                elem_stress_b.resize(3);
+                B_b.resize(3, 9);
+                // construct B and evaluate it at the quadrature point
+                evalBTri(es, sidelen, qps[q][0], qps[q][1], dphi, B_b);
+                temp = Dp;
+                temp.right_multiply(B_b);
+                // bending stress calculation
+                for (unsigned int i = 0; i < 3; i++)
+                  {
+                    for (unsigned int j = 0; j < 3 * nodes; j++)
+                      {
+                        elem_stress_b(i) += temp(i, j) * elem_dis_local_w(j);
+                      }
+                  }
+
+                elem_stress_tensor_b(0, 0) =
+                  elem_stress_tensor_b(0, 0) + elem_stress_b(0);
+                elem_stress_tensor_b(0, 1) =
+                  elem_stress_tensor_b(0, 1) + elem_stress_b(2);
+                elem_stress_tensor_b(1, 0) =
+                  elem_stress_tensor_b(1, 0) + elem_stress_b(2);
+                elem_stress_tensor_b(1, 1) =
+                  elem_stress_tensor_b(1, 1) + elem_stress_b(1);
+              }
+            elem_stress_tensor_b.scale(
+              1.0 / 3.0); // Averaging stress at quadrature points
+            // Moment of inertia hard coded for 10x10 square plate
+            double m_inertia = 10.0 * pow(thickness, 3.0) / 12.0;
+            elem_stress_tensor_b.scale(1.0 / m_inertia);
+            // Transforming stress tensor to global co-ordinate system
+            elem_stress_tensor_b.right_multiply(trafo);
+            elem_stress_tensor_b.left_multiply_transpose(trafo);
           }
 
         if (type == QUAD4)
@@ -1662,7 +1761,9 @@ namespace ShellSolid
             int nodes = 4;
             elem_dis_local.resize(6 * nodes);
             elem_dis_local_uv.resize(2 * nodes);
+            elem_dis_local_w.resize(3 * nodes);
             elem_stress_tensor.resize(3, 3);
+            elem_stress_tensor_b.resize(3, 3);
 
             for (int i = 0; i < nodes; i++)
               {
@@ -1681,27 +1782,81 @@ namespace ShellSolid
               {
                 elem_dis_local_uv(2 * i) = elem_dis_local(6 * i);
                 elem_dis_local_uv(2 * i + 1) = elem_dis_local(6 * i + 1);
+                elem_dis_local_w(3 * i) = elem_dis_local(6 * i + 2);
+                elem_dis_local_w(3 * i + 1) = elem_dis_local(6 * i + 3);
+                elem_dis_local_w(3 * i + 2) = elem_dis_local(6 * i + 4);
               }
 
-            Real root = sqrt(1.0 / 3.0); // Quadrature point
+            // squared side lengths:
+            sidelen.resize(4);
+            sidelen(0) = pow(dphi(0, 0), 2.0) +
+                         pow(dphi(0, 1), 2.0); // side AB, x12^2 + y12^2
+            sidelen(1) = pow(dphi(1, 0), 2.0) +
+                         pow(dphi(1, 1), 2.0); // side BC, x23^2 + y23^2
+            sidelen(2) = pow(dphi(2, 0), 2.0) +
+                         pow(dphi(2, 1), 2.0); // side CD, x34^2 + y34^2
+            sidelen(3) = pow(dphi(3, 0), 2.0) +
+                         pow(dphi(3, 1), 2.0); // side DA, x41^2 + y41^2
+
+            DenseMatrix<Real> Hcoeffs(
+              5, 4); // [ a_k, b_k, c_k, d_k, e_k ], k=5,6,7,8
+            for (int i = 0; i < 4; i++)
+              {
+                Hcoeffs(0, i) = -dphi(i, 0) / sidelen(i); // a_k
+                Hcoeffs(1, i) =
+                  0.75 * dphi(i, 0) * dphi(i, 1) / sidelen(i); // b_k
+                Hcoeffs(2, i) =
+                  (0.25 * pow(dphi(i, 0), 2.0) - 0.5 * pow(dphi(i, 1), 2.0)) /
+                  sidelen(i);                             // c_k
+                Hcoeffs(3, i) = -dphi(i, 1) / sidelen(i); // d_k
+                Hcoeffs(4, i) =
+                  (0.25 * pow(dphi(i, 1), 2.0) - 0.5 * pow(dphi(i, 0), 2.0)) /
+                  sidelen(i); // e_k
+              }
+
+            DenseMatrix<Real> J(2, 2), Jinv(2, 2); // Jacobian and its inverse
+            Real root = sqrt(1.0 / 3.0);           // Quadrature point
             for (int ii = 0; ii < 2; ii++)
               {
                 Real r = pow(-1.0, ii) * root; // +/- root
                 for (int jj = 0; jj < 2; jj++)
                   {
-                    elem_stress.resize(3);
-                    temp.resize(3, 3);
-                    B_m.resize(3, 8);
                     Real s = pow(-1.0, jj) * root; // +/- root
 
+                    elem_stress.resize(3);
+                    elem_stress_b.resize(3);
+                    temp.resize(3, 3);
+                    B_m.resize(3, 8);
+                    B_b.resize(3, 12);
+
+                    J(0, 0) =
+                      (dphi(0, 0) + dphi(2, 0)) * s - dphi(0, 0) + dphi(2, 0);
+                    J(0, 1) =
+                      (dphi(0, 1) + dphi(2, 1)) * s - dphi(0, 1) + dphi(2, 1);
+                    J(1, 0) =
+                      (dphi(0, 0) + dphi(2, 0)) * r - dphi(1, 0) + dphi(3, 0);
+                    J(1, 1) =
+                      (dphi(0, 1) + dphi(2, 1)) * r - dphi(1, 1) + dphi(3, 1);
+                    J *= 0.25;
+                    Real det = J.det();
+
+                    Jinv(0, 0) = J(1, 1);
+                    Jinv(0, 1) = -J(0, 1);
+                    Jinv(1, 0) = -J(1, 0);
+                    Jinv(1, 1) = J(0, 0);
+                    Jinv *= 1.0 / det;
+
+                    // construct strain-displacement-matrix B and evaluate it at
+                    // the current quadrature point:
                     B_plane_quad(&area, dphi, transUV, r, s, B_m);
+                    evalBQuad(es, Hcoeffs, r, s, Jinv, B_b);
 
                     temp = Dm;
                     temp.right_multiply(B_m);
 
                     for (unsigned int i = 0; i < 3; i++)
                       {
-                        for (unsigned int j = 0; j < 8; j++)
+                        for (unsigned int j = 0; j < 2 * nodes; j++)
                           {
                             elem_stress(i) += temp(i, j) * elem_dis_local_uv(j);
                           }
@@ -1716,12 +1871,39 @@ namespace ShellSolid
                     elem_stress_tensor(1, 1) =
                       elem_stress_tensor(1, 1) + elem_stress(1);
 
-                    elem_stress_tensor.right_multiply(trafo);
-                    elem_stress_tensor.left_multiply_transpose(trafo);
+                    temp = Dp;
+                    temp.right_multiply(B_b);
+
+                    for (unsigned int i = 0; i < 3; i++)
+                      {
+                        for (unsigned int j = 0; j < 3 * nodes; j++)
+                          {
+                            elem_stress_b(i) +=
+                              temp(i, j) * elem_dis_local_w(j);
+                          }
+                      }
+
+                    elem_stress_tensor_b(0, 0) =
+                      elem_stress_tensor_b(0, 0) + elem_stress_b(0);
+                    elem_stress_tensor_b(0, 1) =
+                      elem_stress_tensor_b(0, 1) + elem_stress_b(2);
+                    elem_stress_tensor_b(1, 0) =
+                      elem_stress_tensor_b(1, 0) + elem_stress_b(2);
+                    elem_stress_tensor_b(1, 1) =
+                      elem_stress_tensor_b(1, 1) + elem_stress_b(1);
                   }
               }
-            elem_stress_tensor.scale(
-              1.0 / 4.0); // Averaging stress at quadrature points
+            // Averaging stress at quadrature points
+            elem_stress_tensor.scale(1.0 / 4.0);
+            elem_stress_tensor_b.scale(1.0 / 4.0);
+            // Moment of inertia hard coded for 10x10 square plate
+            double m_inertia = 10.0 * pow(thickness, 3.0) / 12.0;
+            elem_stress_tensor_b.scale(1.0 / m_inertia);
+            // Transforming stress tensor to global co-ordinate system
+            elem_stress_tensor.right_multiply(trafo);
+            elem_stress_tensor.left_multiply_transpose(trafo);
+            elem_stress_tensor_b.right_multiply(trafo);
+            elem_stress_tensor_b.left_multiply_transpose(trafo);
           }
 
         // saving element stress in the system
@@ -1740,12 +1922,27 @@ namespace ShellSolid
                     stress_system.solution->set(dof_index,
                                                 elem_stress_tensor(i, j));
                   }
+
+                stress_b_dof_map.dof_indices(
+                  elem, stress_b_dof_indices_var, sigma_vars_b[i][j]);
+                dof_id_type dof_index_b = stress_b_dof_indices_var[0];
+
+                if ((stress_system_b.solution->first_local_index() <=
+                     dof_index_b) &&
+                    (dof_index_b <
+                     stress_system_b.solution->last_local_index()))
+                  {
+                    stress_system_b.solution->set(dof_index_b,
+                                                  elem_stress_tensor_b(i, j));
+                  }
               }
           }
       }
 
     stress_system.solution->close();
     stress_system.update();
+    stress_system_b.solution->close();
+    stress_system_b.update();
   }
 
   /**

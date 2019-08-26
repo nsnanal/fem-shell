@@ -139,12 +139,13 @@ namespace ShellSolid
     static void assemble_elasticity(EquationSystems &es,
                                     const std::string &system_name);
 
-    void stress_calculation();
+    void stress_calculation(EquationSystems &es);
 
     SerialMesh mesh;
     EquationSystems equation_systems;
     LinearImplicitSystem &system;
-    ExplicitSystem &stress_system;
+    ExplicitSystem &stress_system;   // Membrane Stresses
+    ExplicitSystem &stress_system_b; // Bending Stresses
 
     std::string in_filename;               // mesh file for import
     std::string force_filename;            // forcefile
