@@ -249,7 +249,7 @@ namespace ShellSolid
 
     equation_systems.build_solution_vector(sols);
 
-    stress_calculation(equation_systems);
+    stress_calculation();
 
     if (debug)
       {
@@ -1535,7 +1535,7 @@ namespace ShellSolid
   }
 
   /* Stress Calculation*/
-  void shellsolid::stress_calculation(EquationSystems &es)
+  void shellsolid::stress_calculation()
   {
     const unsigned int dim = mesh.mesh_dimension();
 
@@ -1725,7 +1725,8 @@ namespace ShellSolid
                 elem_stress_b.resize(3);
                 B_b.resize(3, 9);
                 // construct B and evaluate it at the quadrature point
-                evalBTri(es, sidelen, qps[q][0], qps[q][1], dphi, B_b);
+                evalBTri(
+                  equation_systems, sidelen, qps[q][0], qps[q][1], dphi, B_b);
                 temp = Dp;
                 temp.right_multiply(B_b);
                 // bending stress calculation
@@ -1849,7 +1850,7 @@ namespace ShellSolid
                     // construct strain-displacement-matrix B and evaluate it at
                     // the current quadrature point:
                     B_plane_quad(&area, dphi, transUV, r, s, B_m);
-                    evalBQuad(es, Hcoeffs, r, s, Jinv, B_b);
+                    evalBQuad(equation_systems, Hcoeffs, r, s, Jinv, B_b);
 
                     temp = Dm;
                     temp.right_multiply(B_m);

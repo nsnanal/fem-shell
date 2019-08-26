@@ -139,7 +139,7 @@ namespace ShellSolid
     static void assemble_elasticity(EquationSystems &es,
                                     const std::string &system_name);
 
-    void stress_calculation(EquationSystems &es);
+    void stress_calculation();
 
     SerialMesh mesh;
     EquationSystems equation_systems;
