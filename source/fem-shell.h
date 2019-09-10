@@ -141,8 +141,6 @@ namespace ShellSolid
 
     void stress_calculation();
 
-    void calculate_drilling();
-
     SerialMesh mesh;
     EquationSystems equation_systems;
     LinearImplicitSystem &system;
