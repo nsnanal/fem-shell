@@ -1946,6 +1946,178 @@ namespace ShellSolid
     stress_system_b.update();
   }
 
+  void shellsolid::calculate_drilling()
+  {
+    const unsigned int dim = mesh.mesh_dimension();
+
+    unsigned int displacement_vars[6];
+    displacement_vars[0] = system.variable_number("u");
+    displacement_vars[1] = system.variable_number("v");
+    displacement_vars[2] = system.variable_number("w");
+    displacement_vars[3] = system.variable_number("tx");
+    displacement_vars[4] = system.variable_number("ty");
+    displacement_vars[5] = system.variable_number("tz");
+
+    const DofMap &dof_map = system.get_dof_map();
+    std::vector<std::vector<dof_id_type>> dof_indices_var(
+      system.n_vars()); // Vector stores global dof dof_indices_var[var
+                        // no.][node no.]
+
+    DenseMatrix<Real> B_m; // Strain displacement matrix
+    DenseMatrix<Real>
+      trafo; // global to local coordinate system transformation matrix
+
+    DenseMatrix<Real>
+      transUV; // stores the transformed positions of the element's nodes
+    DenseMatrix<Real>
+      dphi;          // contains the first partial derivatives of the element
+    Real area = 0.0; // the area of the element
+
+    // plane element stress calculation
+    DenseVector<Real> elem_dis_local; // element displacement at eact node (u1,
+                                      // v1, w1) in local co-ordinates
+    DenseVector<Real> elem_dis_local_w; // element displacement at each node,
+                                        // only w (w1,w1,w2,w2,..)
+    DenseVector<Real> elem_drilling; // element drilling at centre of the cell
+    DenseVector<Real> elem_drilling_global;
+    std::vector<int> sorounding_elements(
+      system.n_dofs(), 0); // calculate no. of sorounding elements
+
+    MeshBase::const_element_iterator el = mesh.active_local_elements_begin();
+    const MeshBase::const_element_iterator end_el =
+      mesh.active_local_elements_end();
+
+    el = mesh.active_local_elements_begin();
+    for (; el != end_el; ++el)
+      {
+        const Elem *elem = *el;
+        ElemType type = elem->type();
+
+        for (unsigned int var = 0; var < 6; var++)
+          {
+            dof_map.dof_indices(
+              elem, dof_indices_var[var], displacement_vars[var]);
+          }
+        initElement(&elem, transUV, trafo, dphi, &area);
+
+        if (type == QUAD4)
+          {
+            int nodes = 4;
+            elem_dis_local.resize(3 * nodes);
+            elem_drilling.resize(3);
+            elem_drilling_global.resize(3);
+            elem_dis_local_w.resize(2 * nodes);
+
+            // transform (u,v,w) into local co-ordinates
+            for (int i = 0; i < nodes; i++)
+              {
+                for (int j = 0; j < 3; j++)
+                  {
+                    for (int k = 0; k < 3; k++)
+                      {
+                        elem_dis_local(j + 3 * i) +=
+                          trafo(j, k) *
+                          system.current_solution(dof_indices_var[k][i]);
+                      }
+                  }
+              }
+
+            for (int i = 0; i < nodes; i++)
+              {
+                elem_dis_local_w(2 * i) = elem_dis_local(3 * i + 2);
+                elem_dis_local_w(2 * i + 1) = elem_dis_local(3 * i + 2);
+                sorounding_elements[(dof_indices_var[3][i])] =
+                  sorounding_elements[(dof_indices_var[3][i])] + 1;
+              }
+
+            // calculate dw/dx and dw/dy using strain-displacement matrix
+
+            B_m.resize(3, 8);
+            B_plane_quad(&area, dphi, transUV, 0, 0, B_m);
+
+            for (unsigned int i = 0; i < 2; i++)
+              {
+                for (unsigned int j = 0; j < 2 * nodes; j++)
+                  {
+                    elem_drilling(i) += B_m(i, j) * elem_dis_local_w(j);
+                  }
+              }
+
+            // theta_x = dw/dy theta_y = -dw/dx
+            double theta = elem_drilling(0);
+            elem_drilling(0) = elem_drilling(1);
+            elem_drilling(1) = -theta;
+
+            // transforming drillings into global co-ordinates
+            for (int i = 0; i < 3; i++)
+              {
+                for (int j = 0; j < 3; j++)
+                  {
+                    elem_drilling_global(i) += trafo(j, i) * elem_drilling(i);
+                  }
+              }
+
+            // add theta_x, theta_y to ndoes
+            system.update();
+
+            for (int i = 0; i < nodes; i++)
+              {
+                double current_theta_x =
+                  system.current_solution(dof_indices_var[3][i]);
+                double current_theta_y =
+                  system.current_solution(dof_indices_var[4][i]);
+                system.solution->set(dof_indices_var[3][i],
+                                     current_theta_x + elem_drilling_global(0));
+                system.solution->set(dof_indices_var[4][i],
+                                     current_theta_y + elem_drilling_global(1));
+              }
+          }
+      }
+
+    // averaging
+    system.update();
+    std::vector<bool> vertex_touched(system.n_dofs(), false);
+
+    el = mesh.active_local_elements_begin();
+    for (; el != end_el; ++el)
+      {
+        const Elem *elem = *el;
+        ElemType type = elem->type();
+
+        for (unsigned int var = 0; var < 6; var++)
+          {
+            dof_map.dof_indices(
+              elem, dof_indices_var[var], displacement_vars[var]);
+          }
+        if (type == QUAD4)
+          {
+
+            int nodes = 4;
+
+            for (int i = 0; i < nodes; i++)
+              {
+                if (!vertex_touched[(dof_indices_var[3][i])])
+                  {
+                    vertex_touched[(dof_indices_var[3][i])] = true;
+                    double current_theta_x =
+                      system.current_solution(dof_indices_var[3][i]);
+                    double current_theta_y =
+                      system.current_solution(dof_indices_var[4][i]);
+                    system.solution->set(
+                      dof_indices_var[3][i],
+                      current_theta_x /
+                        sorounding_elements[(dof_indices_var[3][i])]);
+                    system.solution->set(
+                      dof_indices_var[4][i],
+                      current_theta_y /
+                        sorounding_elements[(dof_indices_var[3][i])]);
+                  }
+              }
+          }
+      }
+    system.update();
+  }
+
   /**
    * creates output file of the displaced mesh with all solution data
    * @param mesh reference, in-param, needed as parameter for mesh export object
